@@ -81,4 +81,4 @@ payload는 현재 "[" + nickname + "] " + message 형태의 문자열을 전송�
 
 Windows에서 처음 실행 시 방화벽 팝업이 뜨면 Private network 허용이 필요할 수 있습니다.
 
-파일 인코딩 경고(C4819)가 뜨면 소스 파일을 UTF-8(with BOM)로 저장하면 해결됩니다.Protocol
+파일 인코딩 경고(C4819)가 뜨면 소스 파일을 UTF-8(with BOM)로 저장하면 해결됩니다.
