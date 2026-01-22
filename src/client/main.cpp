@@ -49,6 +49,12 @@ static void print_incoming(const json& j) {
     std::cout << "! error: " << j.value("text", "") << "\n";
     return;
   }
+  if (type == "hello") {
+    std::cout << "* hello ok. nick=" << j.value("nick","")
+              << ", room=" << j.value("room","") << "\n";
+    return;
+  }
+
   if (type == "who") {
     std::cout << "* users in [" << j.value("room", "") << "]: ";
     if (j.contains("users") && j["users"].is_array()) {

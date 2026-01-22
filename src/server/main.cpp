@@ -1,10 +1,14 @@
 #include <iostream>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <iomanip>
+#include <filesystem>
 
 #include "net/net_platform.h"
 #include "common/json_io.h"
@@ -22,6 +26,52 @@ struct Client {
 static std::mutex g_mx;
 static std::unordered_map<socket_t, Client> g_clients;
 
+// 로그용 뮤텍스(별도)
+static std::mutex g_log_mx;
+
+static std::string today_yyyymmdd() {
+  using namespace std::chrono;
+  auto now = system_clock::now();
+  std::time_t t = system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  tm = *std::localtime(&t);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%Y%m%d");
+  return oss.str();
+}
+
+static std::string now_hhmmss() {
+  using namespace std::chrono;
+  auto now = system_clock::now();
+  std::time_t t = system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  tm = *std::localtime(&t);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%H:%M:%S");
+  return oss.str();
+}
+
+static void append_log(const std::string& line) {
+  std::lock_guard<std::mutex> lk(g_log_mx);
+  try {
+    std::filesystem::create_directories("logs");
+  } catch (...) {
+    // ignore
+  }
+  std::string filename = "logs/chat_" + today_yyyymmdd() + ".txt";
+  std::ofstream ofs(filename, std::ios::app);
+  if (!ofs) return;
+  ofs << "[" << now_hhmmss() << "] " << line << "\n";
+}
+
 static bool nick_taken_locked(const std::string& nick) {
   for (auto& [_, c] : g_clients) {
     if (c.nick == nick) return true;
@@ -29,49 +79,88 @@ static bool nick_taken_locked(const std::string& nick) {
   return false;
 }
 
+// (1) 닉 중복이면 자동 suffix 붙여서 유니크하게 만들기
+static std::string make_unique_nick_locked(const std::string& base) {
+  if (!nick_taken_locked(base)) return base;
+  for (int i = 2; i <= 9999; i++) {
+    std::string cand = base + "_" + std::to_string(i);
+    if (!nick_taken_locked(cand)) return cand;
+  }
+  // 여기까지 오면 거의 비정상(안전 fallback)
+  return base + "_" + std::to_string(std::rand() % 100000);
+}
+
 static void send_error(socket_t s, const std::string& text) {
   json j = {{"type","error"}, {"text", text}};
   jsonio::send_json(s, j);
 }
 
+static bool send_json_or_fail(socket_t s, const json& j) {
+  return jsonio::send_json(s, j);
+}
+
+// (3) 전송 실패(끊긴 클라) 자동 제거 유틸
+static void drop_client_locked(socket_t s) {
+  auto it = g_clients.find(s);
+  if (it == g_clients.end()) return;
+  net::close_socket(it->second.sock);
+  g_clients.erase(it);
+}
+
 static void send_system_to_room(const std::string& room, const std::string& text) {
-  std::lock_guard<std::mutex> lk(g_mx);
-  for (auto& [_, c] : g_clients) {
-    if (c.room != room) continue;
-    jsonio::send_json(c.sock, json{{"type","system"}, {"text", text}});
+  std::vector<socket_t> to_drop;
+  {
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (auto& [_, c] : g_clients) {
+      if (c.room != room) continue;
+      json j = {{"type","system"}, {"text", text}};
+      if (!send_json_or_fail(c.sock, j)) {
+        to_drop.push_back(c.sock);
+      }
+    }
+    for (auto s : to_drop) drop_client_locked(s);
   }
+  append_log("[system][" + room + "] " + text);
 }
 
 static void broadcast_chat_to_room(const std::string& room,
                                   const std::string& from,
-                                  const std::string& text,
-                                  socket_t except = net::INVALID_SOCKET_FD) {
-  std::lock_guard<std::mutex> lk(g_mx);
-  json msg = {{"type","chat"}, {"room", room}, {"from", from}, {"text", text}};
-  for (auto& [_, c] : g_clients) {
-    if (c.sock == except) continue;
-    if (c.room != room) continue;
-    jsonio::send_json(c.sock, msg);
+                                  const std::string& text) {
+  std::vector<socket_t> to_drop;
+  {
+    std::lock_guard<std::mutex> lk(g_mx);
+    json msg = {{"type","chat"}, {"room", room}, {"from", from}, {"text", text}};
+    for (auto& [_, c] : g_clients) {
+      if (c.room != room) continue;
+      if (!send_json_or_fail(c.sock, msg)) {
+        to_drop.push_back(c.sock);
+      }
+    }
+    for (auto s : to_drop) drop_client_locked(s);
   }
-}
-
-static void remove_client(socket_t s) {
-  std::lock_guard<std::mutex> lk(g_mx);
-  g_clients.erase(s);
+  append_log("[chat][" + room + "][" + from + "] " + text);
 }
 
 static void handle_who(socket_t s) {
-  std::lock_guard<std::mutex> lk(g_mx);
-  auto it = g_clients.find(s);
-  if (it == g_clients.end()) return;
-
-  const std::string room = it->second.room;
   std::vector<std::string> users;
-  for (auto& [_, c] : g_clients) {
-    if (c.room == room) users.push_back(c.nick);
+  std::string room;
+
+  {
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_clients.find(s);
+    if (it == g_clients.end()) return;
+    room = it->second.room;
+
+    for (auto& [_, c] : g_clients) {
+      if (c.room == room) users.push_back(c.nick);
+    }
   }
+
   json resp = {{"type","who"}, {"room", room}, {"users", users}};
-  jsonio::send_json(s, resp);
+  if (!send_json_or_fail(s, resp)) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    drop_client_locked(s);
+  }
 }
 
 static void client_thread(socket_t s) {
@@ -95,7 +184,7 @@ static void client_thread(socket_t s) {
 
     std::string type = msg["type"].get<std::string>();
 
-    // 클라가 hello를 안 했으면, hello만 허용(서비스처럼)
+    // hello 전에는 hello만 허용
     {
       std::lock_guard<std::mutex> lk(g_mx);
       auto it = g_clients.find(s);
@@ -111,31 +200,35 @@ static void client_thread(socket_t s) {
         send_error(s, "hello requires nick");
         continue;
       }
-      std::string nick = msg["nick"].get<std::string>();
-      if (nick.empty() || nick.size() > 20) {
+      std::string requested = msg["nick"].get<std::string>();
+      if (requested.empty() || requested.size() > 20) {
         send_error(s, "invalid nick length");
         continue;
       }
 
-      std::string old_room;
-      std::string old_nick;
+      std::string assigned;
+      std::string room;
+
       {
         std::lock_guard<std::mutex> lk(g_mx);
-        auto& c = g_clients[s];
-        old_room = c.room;
-        old_nick = c.nick;
+        auto it = g_clients.find(s);
+        if (it == g_clients.end()) break;
 
-        if (nick_taken_locked(nick)) {
-          send_error(s, "nickname already in use");
-          continue;
-        }
-        c.nick = nick;
-        c.hello_done = true;
+        assigned = make_unique_nick_locked(requested);
+        it->second.nick = assigned;
+        it->second.hello_done = true;
+        room = it->second.room;
       }
 
-      jsonio::send_json(s, json{{"type","system"},{"text","hello ok"}});
+      // hello 응답(클라가 실제 닉네임 확인 가능)
+      json ack = {{"type","hello"}, {"nick", assigned}, {"room", room}};
+      if (!send_json_or_fail(s, ack)) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        drop_client_locked(s);
+        break;
+      }
 
-      send_system_to_room(old_room, nick + " joined " + old_room);
+      send_system_to_room(room, assigned + " joined " + room);
       continue;
     }
 
@@ -190,13 +283,13 @@ static void client_thread(socket_t s) {
         send_error(s, "nick requires nick");
         continue;
       }
-      std::string newnick = msg["nick"].get<std::string>();
-      if (newnick.empty() || newnick.size() > 20) {
+      std::string requested = msg["nick"].get<std::string>();
+      if (requested.empty() || requested.size() > 20) {
         send_error(s, "invalid nick length");
         continue;
       }
 
-      std::string room, oldnick;
+      std::string oldnick, newnick, room;
       {
         std::lock_guard<std::mutex> lk(g_mx);
         auto it = g_clients.find(s);
@@ -204,10 +297,7 @@ static void client_thread(socket_t s) {
         room = it->second.room;
         oldnick = it->second.nick;
 
-        if (nick_taken_locked(newnick)) {
-          send_error(s, "nickname already in use");
-          continue;
-        }
+        newnick = make_unique_nick_locked(requested);
         it->second.nick = newnick;
       }
 
@@ -223,7 +313,7 @@ static void client_thread(socket_t s) {
     send_error(s, "unknown type: " + type);
   }
 
-  // 연결 종료 처리
+  // 연결 종료 처리(정리 + 시스템 메시지)
   std::string nick, room;
   {
     std::lock_guard<std::mutex> lk(g_mx);
@@ -231,16 +321,17 @@ static void client_thread(socket_t s) {
     if (it != g_clients.end()) {
       nick = it->second.nick;
       room = it->second.room;
+      g_clients.erase(it);
     }
   }
 
-  remove_client(s);
   net::close_socket(s);
 
   if (!nick.empty()) {
     send_system_to_room(room, nick + " disconnected");
   }
 }
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "Usage: chat_server <port>\n";
@@ -287,6 +378,7 @@ int main(int argc, char** argv) {
   }
 
   std::cout << "Server listening on port " << port << "\n";
+  append_log("[server] started on port " + std::to_string(port));
 
   while (true) {
     sockaddr_in caddr{};
@@ -298,6 +390,7 @@ int main(int argc, char** argv) {
     socket_t c = ::accept(srv, reinterpret_cast<sockaddr*>(&caddr), &clen);
     if (c == net::INVALID_SOCKET_FD) continue;
 
+    append_log("[server] client accepted");
     std::thread(client_thread, c).detach();
   }
 }
