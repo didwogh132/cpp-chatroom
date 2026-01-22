@@ -34,6 +34,10 @@ target_include_directories(chat_common PUBLIC
   ${PROJECT_INCLUDE_DIRS}
 )
 
+if (WIN32)
+  target_link_libraries(chat_common PUBLIC ws2_32)
+endif()
+
 # (선택) MSVC에서 소스 인코딩 경고 줄이고 싶으면 주석 해제
 # target_compile_options(chat_common PRIVATE /utf-8)
 

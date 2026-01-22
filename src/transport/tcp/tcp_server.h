@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include "core/chat_core.h"
+#include "net/net_platform.h"
 
 namespace transport::tcp {
 

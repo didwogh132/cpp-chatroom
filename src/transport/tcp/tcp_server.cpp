@@ -1,5 +1,6 @@
 #include "transport/tcp/tcp_server.h"
 #include <iostream>
+#include <cstdint>
 #include <thread>
 #include <sstream>
 
@@ -122,7 +123,7 @@ void TcpServer::accept_loop_() {
 
     // id는 간단히 포인터값/카운터도 가능. 여기서는 주소+포트 대신 "tcp:<handle>"
     std::ostringstream oss;
-    oss << "tcp:" << reinterpret_cast<uintptr_t>(cs);
+    oss << "tcp:" << static_cast<std::uintptr_t>(cs);
 
     auto conn = std::make_shared<TcpConnection>(cs, oss.str());
     core_->on_connect(conn);
