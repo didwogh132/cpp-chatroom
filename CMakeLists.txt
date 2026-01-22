@@ -10,6 +10,7 @@ add_library(chat_core
 )
 
 target_include_directories(chat_core PUBLIC src)
+target_include_directories(chat_core PUBLIC src external)
 
 if(WIN32)
     target_link_libraries(chat_core PUBLIC ws2_32)
