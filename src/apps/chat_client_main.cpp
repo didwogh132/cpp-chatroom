@@ -1,17 +1,17 @@
 #include <iostream>
 #include <thread>
 #include <string>
+
 #include "net/net_platform.h"
 #include "common/json_io.h"
 
-using net::socket_t;
 using jsonio::json;
+using net::socket_t;
 
 static std::string prompt_line(const char* label, const std::string& def = "") {
   std::cout << label;
   if (!def.empty()) std::cout << " (default: " << def << ")";
   std::cout << ": " << std::flush;
-
   std::string line;
   std::getline(std::cin, line);
   if (line.empty()) return def;
@@ -30,33 +30,23 @@ static int prompt_int(const char* label, int def) {
 }
 
 static void print_incoming(const json& j) {
-  if (!j.contains("type") || !j["type"].is_string()) return;
-  std::string type = j["type"].get<std::string>();
-
+  std::string type = j.value("type", "");
   if (type == "chat") {
-    std::string room = j.value("room", "");
-    std::string from = j.value("from", "");
-    std::string text = j.value("text", "");
-    if (!room.empty()) std::cout << "[" << room << "] ";
-    std::cout << from << ": " << text << "\n";
+    std::cout << "[" << j.value("room","") << "] "
+              << j.value("from","") << ": "
+              << j.value("text","") << "\n";
     return;
   }
   if (type == "system") {
-    std::cout << "* " << j.value("text", "") << "\n";
+    std::cout << "* " << j.value("text","") << "\n";
     return;
   }
   if (type == "error") {
-    std::cout << "! error: " << j.value("text", "") << "\n";
+    std::cout << "! error(" << j.value("code","") << "): " << j.value("text","") << "\n";
     return;
   }
-  if (type == "hello") {
-    std::cout << "* hello ok. nick=" << j.value("nick","")
-              << ", room=" << j.value("room","") << "\n";
-    return;
-  }
-
-  if (type == "who") {
-    std::cout << "* users in [" << j.value("room", "") << "]: ";
+  if (type == "who_ok") {
+    std::cout << "* users in [" << j.value("room","") << "]: ";
     if (j.contains("users") && j["users"].is_array()) {
       bool first = true;
       for (auto& u : j["users"]) {
@@ -69,8 +59,11 @@ static void print_incoming(const json& j) {
     std::cout << "\n";
     return;
   }
-
-  // 기타 타입은 raw 출력
+  if (type == "hello_ok") {
+    std::cout << "* hello ok. nick=" << j.value("nick","")
+              << ", room=" << j.value("room","") << "\n";
+    return;
+  }
   std::cout << j.dump() << "\n";
 }
 
@@ -88,10 +81,7 @@ int main() {
   std::string ip = prompt_line("Server IP", "127.0.0.1");
   int port = prompt_int("Port", 9000);
   std::string nick = prompt_line("Nickname");
-  if (nick.empty()) {
-    std::cout << "Nickname is required.\n";
-    return 1;
-  }
+  if (nick.empty()) return 1;
 
   if (!net::init()) {
     std::cerr << "net init failed: " << net::last_error_string() << "\n";
@@ -121,37 +111,34 @@ int main() {
     return 1;
   }
 
-  // hello 전송
-  jsonio::send_json(s, json{{"type","hello"},{"nick",nick}});
-
   std::thread t(recv_loop, s);
 
-  std::cout << "Connected.\n"
-            << "Commands: /who, /join <room>, /nick <new>, /quit\n> ";
+  // hello
+  jsonio::send_json(s, json{{"v",1},{"type","hello"},{"nick",nick},{"req_id","h1"}});
 
+  std::cout << "Commands: /who, /join <room>, /nick <new>, /quit\n> ";
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line == "/quit") break;
 
     if (!line.empty() && line[0] == '/') {
-      // 명령 파싱
       if (line == "/who") {
-        jsonio::send_json(s, json{{"type","who"}});
+        jsonio::send_json(s, json{{"v",1},{"type","who"},{"req_id","w1"}});
       } else if (line.rfind("/join ", 0) == 0) {
         std::string room = line.substr(6);
-        jsonio::send_json(s, json{{"type","join"},{"room",room}});
+        jsonio::send_json(s, json{{"v",1},{"type","join"},{"room",room},{"req_id","j1"}});
       } else if (line.rfind("/nick ", 0) == 0) {
         std::string nn = line.substr(6);
-        jsonio::send_json(s, json{{"type","nick"},{"nick",nn}});
+        jsonio::send_json(s, json{{"v",1},{"type","nick"},{"nick",nn},{"req_id","n1"}});
       } else {
-        std::cout << "! unknown command\n> ";
+        std::cout << "! unknown command\n";
       }
+      std::cout << "> ";
       continue;
     }
 
-    // 일반 채팅
     if (!line.empty()) {
-      jsonio::send_json(s, json{{"type","chat"},{"text",line}});
+      jsonio::send_json(s, json{{"v",1},{"type","chat"},{"text",line}});
     }
     std::cout << "> ";
   }
